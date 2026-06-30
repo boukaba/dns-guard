@@ -1,0 +1,18 @@
+[package]
+name = "dns-guard"
+version = "1.0.0"
+edition = "2021"
+description = "System-wide encrypted DNS proxy for macOS — DoH + DoT"
+
+[[bin]]
+name = "dns-guard"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+ctrlc = "3"
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
