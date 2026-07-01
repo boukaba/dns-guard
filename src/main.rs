@@ -8,7 +8,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-const LISTEN_PORT: u16 = 5300;
+const LISTEN_ADDR: &str = "127.0.0.2";
+const LISTEN_PORT: u16 = 53;
 
 #[derive(Parser)]
 #[command(name = "dns-guard", about = "System-wide encrypted DNS proxy for macOS")]
@@ -22,7 +23,7 @@ struct Cli {
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
-    #[arg(long = "install", help = "Set system DNS to 127.0.0.1 + pf redirect")]
+    #[arg(long = "install", help = "Set system DNS to 127.0.0.2")]
     install: bool,
 
     #[arg(long = "uninstall", help = "Restore default DNS servers")]
@@ -78,9 +79,9 @@ fn run_doh(provider: DnsProvider, running: &AtomicBool) {
         Err(e) => { error!("DoH agent init: {e}"); return; }
     };
 
-    let addr = format!("127.0.0.1:{LISTEN_PORT}");
+    let addr = format!("{LISTEN_ADDR}:{LISTEN_PORT}");
     let sock = UdpSocket::bind(&addr).unwrap_or_else(|e| {
-        panic!("bind {addr}: {e} (is port {LISTEN_PORT} free?)");
+        panic!("bind {addr}: {e}. Is another instance running?");
     });
     sock.set_read_timeout(Some(std::time::Duration::from_millis(500))).ok();
 
@@ -109,7 +110,7 @@ fn run_dot(provider: DnsProvider, running: &AtomicBool) {
         Err(e) => { error!("DoT connect: {e}"); return; }
     };
 
-    let addr = format!("127.0.0.1:{LISTEN_PORT}");
+    let addr = format!("{LISTEN_ADDR}:{LISTEN_PORT}");
     let sock = UdpSocket::bind(&addr).unwrap_or_else(|e| {
         panic!("bind {addr}: {e}");
     });
@@ -142,49 +143,28 @@ fn run_dot(provider: DnsProvider, running: &AtomicBool) {
 }
 
 fn install_system_dns() {
-    info!("installing system DNS → 127.0.0.1:{LISTEN_PORT}");
+    info!("configuring system DNS → {LISTEN_ADDR}");
 
-    // 1. Set system DNS to 127.0.0.1
-    scutil("d.init\nd.add ServerAddresses * 127.0.0.1\nset State:/Network/Global/DNS\nquit\n");
-    let _ = std::fs::write("/etc/resolv.conf", "nameserver 127.0.0.1\n");
+    // Create loopback alias if not exists
+    let _ = Command::new("ifconfig")
+        .args(["lo0", "alias", LISTEN_ADDR, "255.255.255.255"])
+        .status();
 
-    // 2. pf redirect: 127.0.0.1:53 → 127.0.0.1:5300
-    let pf_rule = format!(
-        "rdr pass on lo0 inet proto udp from any to 127.0.0.1 port 53 -> 127.0.0.1 port {LISTEN_PORT}\n"
-    );
-    let _ = std::fs::write("/etc/pf.anchors/dns-guard", &pf_rule);
-
-    // Insert our anchor into main pf.conf if not already there
-    let anchor_line = "dns-guard";
-    let pf_conf_path = "/etc/pf.conf";
-    let existing = std::fs::read_to_string(pf_conf_path).unwrap_or_default();
-    if !existing.contains(&format!("anchor \"{anchor_line}\"")) {
-        let new_conf = format!("{existing}\nanchor \"{anchor_line}\"\nload anchor \"{anchor_line}\" from \"/etc/pf.anchors/dns-guard\"\n");
-        let _ = std::fs::write(pf_conf_path, new_conf);
-    }
-
-    // Reload pf
-    let _ = Command::new("pfctl").args(["-E"]).status();
-    let _ = Command::new("pfctl").args(["-f", "/etc/pf.conf"]).status();
+    scutil(&format!(
+        "d.init\nd.add ServerAddresses * {LISTEN_ADDR}\nset State:/Network/Global/DNS\nquit\n"
+    ));
+    let _ = std::fs::write("/etc/resolv.conf", format!("nameserver {LISTEN_ADDR}\n"));
 
     let _ = Command::new("dscacheutil").arg("-flushcache").status();
     let _ = Command::new("killall").arg("-HUP").arg("mDNSResponder").status();
-    info!("system DNS configured — run 'sudo dns-guard --mode doh' to start");
+    info!("DNS set to {LISTEN_ADDR} — run 'sudo dns-guard --mode doh' to start");
 }
 
 fn uninstall_system_dns() {
-    // Remove pf anchor
-    let _ = Command::new("pfctl").args(["-a", "dns-guard", "-F", "all"]).status();
-    let _ = std::fs::remove_file("/etc/pf.anchors/dns-guard");
-
-    // Remove anchor line from pf.conf
-    if let Ok(conf) = std::fs::read_to_string("/etc/pf.conf") {
-        let cleaned: Vec<&str> = conf.lines()
-            .filter(|l| !l.contains("anchor \"dns-guard\"") && !l.contains("load anchor \"dns-guard\""))
-            .collect();
-        let _ = std::fs::write("/etc/pf.conf", cleaned.join("\n") + "\n");
-        let _ = Command::new("pfctl").args(["-f", "/etc/pf.conf"]).status();
-    }
+    // Remove loopback alias
+    let _ = Command::new("ifconfig")
+        .args(["lo0", "alias", LISTEN_ADDR, "-alias"])
+        .status();
 
     scutil("remove State:/Network/Global/DNS\nquit\n");
     let _ = std::fs::remove_file("/etc/resolv.conf");
