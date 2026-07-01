@@ -52,6 +52,11 @@ fn main() {
         return;
     }
 
+    // Create loopback alias (needed every time we bind)
+    let _ = Command::new("ifconfig")
+        .args(["lo0", "alias", LISTEN_ADDR, "255.255.255.255"])
+        .status();
+
     let mode = parse_mode(&cli.mode);
     let provider = parse_provider(&cli.provider);
 
@@ -70,9 +75,12 @@ fn main() {
         DnsMode::DoT => run_dot(provider, &running),
     }
 
-    // Restore DNS on shutdown
+    // Restore DNS and remove alias on shutdown
     info!("restoring system DNS...");
     uninstall_system_dns();
+    let _ = Command::new("ifconfig")
+        .args(["lo0", "alias", LISTEN_ADDR, "-alias"])
+        .status();
     info!("dns-guard stopped");
 }
 
@@ -148,12 +156,6 @@ fn run_dot(provider: DnsProvider, running: &AtomicBool) {
 fn install_system_dns() {
     info!("configuring system DNS → {LISTEN_ADDR}");
 
-    // Create loopback alias
-    let _ = Command::new("ifconfig")
-        .args(["lo0", "alias", LISTEN_ADDR, "255.255.255.255"])
-        .status();
-
-    // Set DNS on all active network services
     for service in &["Wi-Fi", "Ethernet", "USB 10/100/1000 LAN", "Thunderbolt Bridge"] {
         let _ = Command::new("networksetup")
             .args(["-setdnsservers", service, LISTEN_ADDR])
@@ -167,18 +169,14 @@ fn install_system_dns() {
 }
 
 fn uninstall_system_dns() {
-    // Remove loopback alias
-    let _ = Command::new("ifconfig")
-        .args(["lo0", "alias", LISTEN_ADDR, "-alias"])
-        .status();
-
-    // Restore DNS on all network services to DHCP default (empty = automatic)
     for service in &["Wi-Fi", "Ethernet", "USB 10/100/1000 LAN", "Thunderbolt Bridge"] {
         let _ = Command::new("networksetup")
             .args(["-setdnsservers", service, "Empty"])
             .status();
     }
-
+    let _ = Command::new("ifconfig")
+        .args(["lo0", "alias", LISTEN_ADDR, "-alias"])
+        .status();
     let _ = std::fs::remove_file("/etc/resolv.conf");
     let _ = Command::new("dscacheutil").arg("-flushcache").status();
     let _ = Command::new("killall").arg("-HUP").arg("mDNSResponder").status();
