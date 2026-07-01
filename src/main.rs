@@ -145,16 +145,19 @@ fn run_dot(provider: DnsProvider, running: &AtomicBool) {
 fn install_system_dns() {
     info!("configuring system DNS → {LISTEN_ADDR}");
 
-    // Create loopback alias if not exists
+    // Create loopback alias
     let _ = Command::new("ifconfig")
         .args(["lo0", "alias", LISTEN_ADDR, "255.255.255.255"])
         .status();
 
-    scutil(&format!(
-        "d.init\nd.add ServerAddresses * {LISTEN_ADDR}\nset State:/Network/Global/DNS\nquit\n"
-    ));
-    let _ = std::fs::write("/etc/resolv.conf", format!("nameserver {LISTEN_ADDR}\n"));
+    // Set DNS on all active network services
+    for service in &["Wi-Fi", "Ethernet", "USB 10/100/1000 LAN", "Thunderbolt Bridge"] {
+        let _ = Command::new("networksetup")
+            .args(["-setdnsservers", service, LISTEN_ADDR])
+            .status();
+    }
 
+    let _ = std::fs::write("/etc/resolv.conf", format!("nameserver {LISTEN_ADDR}\n"));
     let _ = Command::new("dscacheutil").arg("-flushcache").status();
     let _ = Command::new("killall").arg("-HUP").arg("mDNSResponder").status();
     info!("DNS set to {LISTEN_ADDR} — run 'sudo dns-guard --mode doh' to start");
@@ -166,26 +169,17 @@ fn uninstall_system_dns() {
         .args(["lo0", "alias", LISTEN_ADDR, "-alias"])
         .status();
 
-    scutil("remove State:/Network/Global/DNS\nquit\n");
+    // Restore DNS on all network services to DHCP default (empty = automatic)
+    for service in &["Wi-Fi", "Ethernet", "USB 10/100/1000 LAN", "Thunderbolt Bridge"] {
+        let _ = Command::new("networksetup")
+            .args(["-setdnsservers", service, "Empty"])
+            .status();
+    }
+
     let _ = std::fs::remove_file("/etc/resolv.conf");
     let _ = Command::new("dscacheutil").arg("-flushcache").status();
     let _ = Command::new("killall").arg("-HUP").arg("mDNSResponder").status();
     info!("system DNS restored");
-}
-
-fn scutil(script: &str) {
-    if let Ok(mut child) = Command::new("scutil")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        use std::io::Write;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(script.as_bytes());
-        }
-        let _ = child.wait();
-    }
 }
 
 fn parse_mode(s: &str) -> DnsMode {
