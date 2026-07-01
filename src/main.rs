@@ -70,6 +70,9 @@ fn main() {
         DnsMode::DoT => run_dot(provider, &running),
     }
 
+    // Restore DNS on shutdown
+    info!("restoring system DNS...");
+    uninstall_system_dns();
     info!("dns-guard stopped");
 }
 
