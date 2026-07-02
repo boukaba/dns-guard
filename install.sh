@@ -2,7 +2,7 @@
 set -eu
 
 REPO="boukaba/dns-guard"
-VERSION="${VERSION:-v1.0.0}"
+VERSION="${VERSION:-v1.1.0}"
 DEST="${DEST:-/usr/local/bin}"
 
 GREEN='\033[0;32m'

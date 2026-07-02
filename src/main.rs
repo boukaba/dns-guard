@@ -1,7 +1,7 @@
 mod dns;
 
 use clap::Parser;
-use dns::{DnsMode, DnsProvider};
+use dns::{DnsMode, DnsProvider, DnsStrategy};
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::net::UdpSocket;
@@ -42,6 +42,9 @@ struct Cli {
     #[arg(long = "provider", help = "DNS provider (cloudflare, google, quad9)")]
     provider: Option<String>,
 
+    #[arg(long = "strategy", help = "Provider selection (single, round-robin, failover)")]
+    strategy: Option<String>,
+
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
@@ -58,6 +61,7 @@ struct Cli {
 struct Config {
     mode: String,
     provider: String,
+    strategy: String,
 }
 
 impl Default for Config {
@@ -65,6 +69,7 @@ impl Default for Config {
         Self {
             mode: "doh".into(),
             provider: "cloudflare".into(),
+            strategy: "single".into(),
         }
     }
 }
@@ -151,6 +156,7 @@ fn main() {
 
     let mode_str = cli.mode.as_deref().unwrap_or(&config.mode);
     let provider_str = cli.provider.as_deref().unwrap_or(&config.provider);
+    let strategy_str = cli.strategy.as_deref().unwrap_or(&config.strategy);
 
     setup_loopback();
 
@@ -158,8 +164,9 @@ fn main() {
 
     let mode = parse_mode(mode_str);
     let provider = parse_provider(provider_str);
+    let strategy = parse_strategy(strategy_str);
 
-    info!("dns-guard starting (mode={mode:?}, provider={provider:?})");
+    info!("dns-guard starting (mode={mode:?}, provider={provider:?}, strategy={strategy:?})");
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -172,13 +179,14 @@ fn main() {
     start_network_watcher(running.clone());
 
     match mode {
-        DnsMode::DoH => run_doh(provider, &running),
-        DnsMode::DoT => run_dot(provider, &running),
+        DnsMode::DoH => run_doh(strategy, provider, &running),
+        DnsMode::DoT => run_dot(strategy, provider, &running),
     }
 
     Config {
         mode: mode_str.to_string(),
         provider: provider_str.to_string(),
+        strategy: strategy_str.to_string(),
     }
     .save();
 
@@ -190,7 +198,7 @@ fn main() {
 
 // ── DNS proxy loops (shared) ───────────────────────────────────────────
 
-fn run_doh(provider: DnsProvider, running: &AtomicBool) {
+fn run_doh(strategy: DnsStrategy, mut provider: DnsProvider, running: &AtomicBool) {
     let agent = match dns::create_doh_agent() {
         Ok(a) => { info!("DoH agent ready"); a }
         Err(e) => { error!("DoH agent init: {e}"); return; }
@@ -203,14 +211,39 @@ fn run_doh(provider: DnsProvider, running: &AtomicBool) {
     sock.set_read_timeout(Some(std::time::Duration::from_millis(500))).ok();
 
     let mut buf = [0u8; 512];
-    info!("listening on {addr} (DoH → {provider:?})");
+    let mut failover_idx: Option<usize> = None;
+
+    info!("listening on {addr} (DoH → {strategy:?})");
 
     while running.load(Ordering::SeqCst) {
         match sock.recv_from(&mut buf) {
             Ok((n, src)) => {
                 if n < 12 { continue; }
-                if let Some(resp) = dns::doh_resolve(&agent, provider, &buf[..n]) {
-                    let _ = sock.send_to(&resp, src);
+
+                let target = match strategy {
+                    DnsStrategy::RoundRobin => dns::next_round_robin(),
+                    DnsStrategy::Failover => failover_idx
+                        .map(|i| dns::ALL_PROVIDERS[i])
+                        .unwrap_or(provider),
+                    DnsStrategy::Single => provider,
+                };
+
+                match dns::doh_resolve_fallible(&agent, target, &buf[..n]) {
+                    Ok(resp) => {
+                        if strategy == DnsStrategy::Failover {
+                            failover_idx = None;
+                        }
+                        let _ = sock.send_to(&resp, src);
+                    }
+                    Err(e) => {
+                        log::warn!("{target:?} failed: {e}");
+                        if strategy == DnsStrategy::Failover {
+                            let next = failover_idx.map(|i| (i + 1) % dns::ALL_PROVIDERS.len()).unwrap_or(1);
+                            failover_idx = Some(next);
+                            provider = dns::ALL_PROVIDERS[next];
+                            log::info!("failing over to {provider:?}");
+                        }
+                    }
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -221,7 +254,7 @@ fn run_doh(provider: DnsProvider, running: &AtomicBool) {
     }
 }
 
-fn run_dot(provider: DnsProvider, running: &AtomicBool) {
+fn run_dot(strategy: DnsStrategy, mut provider: DnsProvider, running: &AtomicBool) {
     let mut conn = match dns::create_dot_conn(provider) {
         Ok(c) => { info!("DoT connection established"); c }
         Err(e) => { error!("DoT connect: {e}"); return; }
@@ -234,16 +267,44 @@ fn run_dot(provider: DnsProvider, running: &AtomicBool) {
     sock.set_read_timeout(Some(std::time::Duration::from_millis(500))).ok();
 
     let mut buf = [0u8; 512];
-    info!("listening on {addr} (DoT → {provider:?})");
+    let mut failover_idx: Option<usize> = None;
+
+    info!("listening on {addr} (DoT → {strategy:?})");
 
     while running.load(Ordering::SeqCst) {
         match sock.recv_from(&mut buf) {
             Ok((n, src)) => {
                 if n < 12 { continue; }
+
+                if strategy == DnsStrategy::RoundRobin {
+                    let next = dns::next_round_robin();
+                    if next != provider {
+                        provider = next;
+                        conn = match dns::create_dot_conn(provider) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("DoT reconnect to {provider:?}: {e}");
+                                continue;
+                            }
+                        };
+                    }
+                }
+
                 match dns::dot_query(&mut conn, &buf[..n]) {
-                    Ok(resp) => { let _ = sock.send_to(&resp, src); }
+                    Ok(resp) => {
+                        if strategy == DnsStrategy::Failover {
+                            failover_idx = None;
+                        }
+                        let _ = sock.send_to(&resp, src);
+                    }
                     Err(e) => {
                         log::warn!("DoT query failed: {e}, reconnecting...");
+                        if strategy == DnsStrategy::Failover {
+                            let next = failover_idx.map(|i| (i + 1) % dns::ALL_PROVIDERS.len()).unwrap_or(1);
+                            failover_idx = Some(next);
+                            provider = dns::ALL_PROVIDERS[next];
+                            log::info!("failing over to {provider:?}");
+                        }
                         match dns::create_dot_conn(provider) {
                             Ok(c) => conn = c,
                             Err(e2) => error!("DoT reconnect: {e2}"),
@@ -725,5 +786,13 @@ fn parse_provider(s: &str) -> DnsProvider {
         "google" => DnsProvider::Google,
         "quad9" => DnsProvider::Quad9,
         _ => DnsProvider::Cloudflare,
+    }
+}
+
+fn parse_strategy(s: &str) -> DnsStrategy {
+    match s.to_lowercase().as_str() {
+        "round-robin" => DnsStrategy::RoundRobin,
+        "failover" => DnsStrategy::Failover,
+        _ => DnsStrategy::Single,
     }
 }

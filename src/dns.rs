@@ -3,6 +3,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +22,26 @@ pub enum DnsProvider {
     Quad9,
 }
 
+pub const ALL_PROVIDERS: [DnsProvider; 3] = [
+    DnsProvider::Cloudflare,
+    DnsProvider::Google,
+    DnsProvider::Quad9,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DnsStrategy {
+    Single,
+    RoundRobin,
+    Failover,
+}
+
+static RR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn next_round_robin() -> DnsProvider {
+    let idx = RR_COUNTER.fetch_add(1, Ordering::Relaxed) % ALL_PROVIDERS.len();
+    ALL_PROVIDERS[idx]
+}
+
 // ── Public API ──
 
 pub fn create_doh_agent() -> Result<ureq::Agent, String> {
@@ -34,14 +55,8 @@ pub fn create_doh_agent() -> Result<ureq::Agent, String> {
         .build())
 }
 
-pub fn doh_resolve(agent: &ureq::Agent, provider: DnsProvider, query: &[u8]) -> Option<Vec<u8>> {
-    match doh_query_with_agent(agent, provider, query) {
-        Ok(resp) => Some(resp),
-        Err(e) => {
-            log::debug!("DoH query failed: {e}");
-            None
-        }
-    }
+pub fn doh_resolve_fallible(agent: &ureq::Agent, provider: DnsProvider, query: &[u8]) -> Result<Vec<u8>, String> {
+    doh_query_with_agent(agent, provider, query)
 }
 
 pub fn create_dot_conn(provider: DnsProvider) -> Result<DotConn, String> {
