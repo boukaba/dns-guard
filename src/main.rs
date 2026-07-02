@@ -274,7 +274,7 @@ fn check_root() {
     use std::ffi::c_void;
 
     const TOKEN_QUERY: u32 = 0x0008;
-    const TokenElevation: u32 = 20;
+    const TOKEN_ELEVATION: u32 = 20;
 
     extern "system" {
         fn GetCurrentProcess() -> *mut c_void;
@@ -303,7 +303,7 @@ fn check_root() {
         let mut ret_len: u32 = 0;
         let ok = GetTokenInformation(
             token,
-            TokenElevation,
+            TOKEN_ELEVATION,
             &mut elevated as *mut _ as *mut c_void,
             std::mem::size_of::<u32>() as u32,
             &mut ret_len,
@@ -606,9 +606,9 @@ fn create_netlink_sock() -> RawFd {
 
         let mut addr: libc::sockaddr_nl = std::mem::zeroed();
         addr.nl_family = libc::AF_NETLINK as u16;
-        addr.nl_groups = libc::RTMGRP_LINK
-            | libc::RTMGRP_IPV4_IFADDR
-            | libc::RTMGRP_IPV6_IFADDR;
+        addr.nl_groups = libc::RTMGRP_LINK as u32
+            | libc::RTMGRP_IPV4_IFADDR as u32
+            | libc::RTMGRP_IPV6_IFADDR as u32;
 
         let ret = libc::bind(
             fd,
@@ -625,22 +625,23 @@ fn create_netlink_sock() -> RawFd {
 
 #[cfg(target_os = "windows")]
 mod ffi {
-    #![allow(non_snake_case, dead_code, unused)]
+    #![allow(non_snake_case, dead_code, unused, non_camel_case_types)]
 
     use std::ffi::c_void;
 
     const AF_UNSPEC: u16 = 0;
 
-    type NOTIFY_CALLBACK = unsafe extern "system" fn(
+    type NotifyCallback = unsafe extern "system" fn(
         *mut c_void,
         *mut c_void,
         i32,
     );
 
+    #[link(name = "iphlpapi")]
     extern "system" {
         fn NotifyIpInterfaceChange(
             Family: u16,
-            Callback: Option<NOTIFY_CALLBACK>,
+            Callback: Option<NotifyCallback>,
             CallerContext: *mut c_void,
             InitialNotification: u8,
             NotificationHandle: *mut *mut c_void,
@@ -651,7 +652,7 @@ mod ffi {
         ) -> u32;
     }
 
-    pub fn register(callback: NOTIFY_CALLBACK) -> Result<*mut c_void, u32> {
+    pub fn register(callback: NotifyCallback) -> Result<*mut c_void, u32> {
         let mut handle: *mut c_void = std::ptr::null_mut();
         let ret = unsafe {
             NotifyIpInterfaceChange(
