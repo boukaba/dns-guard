@@ -2,7 +2,7 @@
 name = "dns-guard"
 version = "1.0.0"
 edition = "2021"
-description = "System-wide encrypted DNS proxy for macOS — DoH + DoT"
+description = "System-wide encrypted DNS proxy — DoH + DoT"
 
 [[bin]]
 name = "dns-guard"
@@ -16,3 +16,9 @@ libc = "0.2"
 ctrlc = "3"
 ureq = { version = "2", default-features = false, features = ["native-tls"] }
 native-tls = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+system-configuration = "0.7"
