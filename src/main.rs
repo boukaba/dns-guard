@@ -1,5 +1,6 @@
 mod dns;
 mod grpc;
+mod rest;
 mod state;
 
 use clap::{Parser, Subcommand};
@@ -110,6 +111,22 @@ enum Commands {
         #[arg(long)]
         addr: Option<String>,
     },
+    /// CLI client: query live stats from a running server
+    Stats {
+        #[arg(long)]
+        addr: Option<String>,
+    },
+    /// CLI client: list or modify the block/allow policy
+    Policy {
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long, help = "Block a domain (and its subdomains)")]
+        block: Option<String>,
+        #[arg(long, help = "Allow a domain (overrides an earlier block)")]
+        allow: Option<String>,
+        #[arg(long, help = "Remove all rules")]
+        clear: bool,
+    },
 }
 
 /// Default Unix socket path (shared with the GUI): lives in the user's
@@ -120,11 +137,16 @@ fn default_socket() -> String {
 
 // ── Config file ─────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Config {
+    #[serde(default)]
     mode: String,
+    #[serde(default)]
     provider: String,
+    #[serde(default)]
     strategy: String,
+    #[serde(default)]
+    policy: Vec<PolicyRule>,
 }
 
 impl Default for Config {
@@ -133,30 +155,59 @@ impl Default for Config {
             mode: "doh".into(),
             provider: "cloudflare".into(),
             strategy: "single".into(),
+            policy: Vec::new(),
         }
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PolicyRule {
+    pattern: String,
+    action: String,
+}
+
+/// Block/allow rules evaluated per-query. Any ALLOW match overrides all
+/// BLOCK matches (allowlists win); the default is allow. Patterns match
+/// the domain itself and any subdomain ("example.com" matches
+/// "example.com" + "a.example.com").
+#[derive(Clone, Default)]
+struct Policy {
+    rules: Vec<PolicyRule>,
+}
+
+impl Policy {
+    fn from_config(cfg: &Config) -> Self {
+        Policy { rules: cfg.policy.clone() }
+    }
+
+    fn blocked(&self, domain: &str) -> bool {
+        let mut blocked = false;
+        for r in &self.rules {
+            if pattern_matches(&r.pattern, domain) {
+                if r.action == "allow" {
+                    return false;
+                }
+                blocked = true;
+            }
+        }
+        blocked
+    }
+}
+
+fn pattern_matches(pattern: &str, domain: &str) -> bool {
+    let pat = pattern.trim().trim_start_matches('.').to_ascii_lowercase();
+    if pat.is_empty() || domain.is_empty() {
+        return false;
+    }
+    domain == pat || domain.ends_with(&format!(".{pat}"))
+}
+
 impl Config {
     fn path() -> PathBuf {
-        #[cfg(unix)]
-        {
-            if let Ok(home) = std::env::var("XDG_CONFIG_HOME") {
-                PathBuf::from(home).join("dns-guard").join("config.json")
-            } else if let Ok(home) = std::env::var("HOME") {
-                PathBuf::from(home).join(".config").join("dns-guard").join("config.json")
-            } else {
-                PathBuf::from("/etc/dns-guard/config.json")
-            }
-        }
-        #[cfg(windows)]
-        {
-            if let Ok(appdata) = std::env::var("APPDATA") {
-                PathBuf::from(appdata).join("dns-guard").join("config.json")
-            } else {
-                PathBuf::from("C:\\ProgramData\\dns-guard\\config.json")
-            }
-        }
+        // Same directory as all other state files, so DNS_GUARD_DIR /
+        // --state-dir (root-spawned proxies) and the daemon agree on
+        // where config.json lives.
+        guard_state::dir().join("config.json")
     }
 
     fn load() -> Self {
@@ -318,6 +369,14 @@ async fn async_main(cli: Cli) {
             let sock = addr.unwrap_or_else(default_socket);
             cmd_client_set_password(&sock, &password, json).await;
         }
+        Some(Commands::Stats { addr }) => {
+            let sock = addr.unwrap_or_else(default_socket);
+            cmd_client_stats(&sock, json).await;
+        }
+        Some(Commands::Policy { addr, block, allow, clear }) => {
+            let sock = addr.unwrap_or_else(default_socket);
+            cmd_client_policy(&sock, block, allow, clear, json).await;
+        }
         None => {
             cmd_standalone(cli, background);
         }
@@ -384,7 +443,8 @@ async fn cmd_serve(socket_path: &str, daemon: bool) {
     let _ = std::fs::remove_file(socket_path);
 
     let service = Arc::new(grpc::ProxyService::load_or_new());
-    let svc = grpc::proto::dns_guard_server::DnsGuardServer::new(service);
+    let svc = grpc::proto::dns_guard_server::DnsGuardServer::new(service.clone());
+    rest::serve(service);
 
     let listener = match tokio::net::UnixListener::bind(socket_path) {
         Ok(l) => l,
@@ -635,6 +695,140 @@ async fn cmd_client_set_password(addr: &str, password: &str, json: bool) {
     }
 }
 
+async fn cmd_client_stats(addr: &str, json: bool) {
+    use grpc::proto::dns_guard_client::DnsGuardClient;
+    use grpc::proto::GetStatsRequest;
+
+    let channel = client_channel(addr);
+    let mut client = DnsGuardClient::new(channel);
+
+    match client.get_stats(tonic::Request::new(GetStatsRequest {})).await {
+        Ok(r) => {
+            let s = r.into_inner();
+            if json {
+                println!("{}", serde_json::json!({
+                    "queries_total": s.queries_total,
+                    "cached_total": s.cached_total,
+                    "blocked_total": s.blocked_total,
+                    "errors_total": s.errors_total,
+                    "per_provider": s.per_provider,
+                    "top_domains": s.top_domains,
+                }));
+            } else {
+                println!("queries: {}", s.queries_total);
+                println!("cached:  {}", s.cached_total);
+                println!("blocked: {}", s.blocked_total);
+                println!("errors:  {}", s.errors_total);
+                println!("per provider:");
+                for (p, n) in &s.per_provider {
+                    println!("  {p}: {n}");
+                }
+                println!("top domains:");
+                for (d, n) in &s.top_domains {
+                    println!("  {d}: {n}");
+                }
+            }
+        }
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({"error": format!("{e}")}));
+            } else {
+                eprintln!("error: {e}");
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_client_policy(
+    addr: &str,
+    block: Option<String>,
+    allow: Option<String>,
+    clear: bool,
+    json: bool,
+) {
+    use grpc::proto::dns_guard_client::DnsGuardClient;
+    use grpc::proto::{GetPolicyRequest, Policy};
+
+    let channel = client_channel(addr);
+    let mut client = DnsGuardClient::new(channel);
+
+    let current = match client.get_policy(tonic::Request::new(GetPolicyRequest {})).await {
+        Ok(r) => r.into_inner(),
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({"ok": false, "message": format!("{e}")}));
+            } else {
+                eprintln!("error: {e}");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    // No mutation flags: just print the current policy.
+    if block.is_none() && allow.is_none() && !clear {
+        if json {
+            let rules: Vec<serde_json::Value> = current
+                .rules
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "pattern": r.pattern,
+                        "action": if r.action == 1 { "block" } else { "allow" },
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::json!({"rules": rules}));
+        } else if current.rules.is_empty() {
+            println!("policy: no rules (allow all)");
+        } else {
+            for r in &current.rules {
+                let action = if r.action == 1 { "block" } else { "allow" };
+                println!("{action} {}", r.pattern);
+            }
+        }
+        return;
+    }
+
+    let mut rules = current.rules;
+    if clear {
+        rules.clear();
+    }
+    if let Some(pat) = block {
+        rules.push(grpc::proto::policy::Rule { pattern: pat, action: 1 });
+    }
+    if let Some(pat) = allow {
+        rules.push(grpc::proto::policy::Rule { pattern: pat, action: 0 });
+    }
+
+    match client
+        .set_policy(tonic::Request::new(Policy { rules }))
+        .await
+    {
+        Ok(r) => {
+            let resp = r.into_inner();
+            if json {
+                println!("{}", serde_json::json!({"ok": resp.ok, "message": resp.message}));
+            } else if resp.ok {
+                println!("policy updated");
+            } else {
+                eprintln!("{}", resp.message);
+            }
+            if !resp.ok {
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({"ok": false, "message": format!("{e}")}));
+            } else {
+                eprintln!("error: {e}");
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
 // ── Standalone mode (existing behaviour) ───────────────────────────────
 
 fn cmd_standalone(cli: Cli, background: bool) {
@@ -692,6 +886,9 @@ fn cmd_standalone(cli: Cli, background: bool) {
 
     start_network_watcher(running.clone());
 
+    let policy = Arc::new(parking_lot::RwLock::new(Policy::from_config(&config)));
+    let events = Arc::new(QueryEvents::open().unwrap_or_else(QueryEvents::disabled));
+
     // Hot-swap loop: run_doh/run_dot return Some(cfg) when mode changes
     while running.load(Ordering::SeqCst) {
         let mode = parse_mode(&config.mode);
@@ -701,8 +898,8 @@ fn cmd_standalone(cli: Cli, background: bool) {
         info!("listening on {LISTEN_ADDR}:{LISTEN_PORT} ({mode:?} → {provider:?} / {strategy:?})");
 
         let changed = match mode {
-            DnsMode::DoH => run_doh(strategy, provider, &running),
-            DnsMode::DoT => run_dot(strategy, provider, &running),
+            DnsMode::DoH => run_doh(strategy, provider, policy.clone(), events.clone(), &running),
+            DnsMode::DoT => run_dot(strategy, provider, policy.clone(), events.clone(), &running),
         };
 
         if let Some(c) = changed {
@@ -797,19 +994,141 @@ fn pick_target(
     }
 }
 
-/// Resolve a query (cache first), returning a full response with the
-/// requester's transaction ID patched in. Never fails: on upstream
-/// error it returns SERVFAIL so the client doesn't hang.
+// ── Per-query event log ────────────────────────────────────────────────
+//
+// The proxy appends one JSON line per query to query.log (world-readable,
+// truncated at proxy start). The daemon tails it and serves WatchQueries /
+// GetStats, so both supervision models (CLI child pipes and GUI-adopted
+// file tailing) produce the same query feed.
+
+#[derive(Serialize)]
+struct QueryRecordData {
+    domain: String,
+    provider: String,
+    mode: String,
+    strategy: String,
+    rtt_ms: u64,
+    cached: bool,
+    blocked: bool,
+    error: bool,
+    ts_ms: u64,
+}
+
+pub struct QueryEvents {
+    inner: parking_lot::Mutex<Option<std::io::BufWriter<std::fs::File>>>,
+}
+
+impl QueryEvents {
+    /// Create (truncating) query.log in the state dir. Returns None when
+    /// the file cannot be opened — event logging is best-effort.
+    fn open() -> Option<Self> {
+        let dir = guard_state::dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = guard_state::query_log_path();
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        }
+        Some(QueryEvents {
+            inner: parking_lot::Mutex::new(Some(std::io::BufWriter::new(f))),
+        })
+    }
+
+    /// Null emitter for tests and when logging is unavailable.
+    fn disabled() -> Self {
+        QueryEvents { inner: parking_lot::Mutex::new(None) }
+    }
+
+    fn emit(&self, rec: &QueryRecordData) {
+        let Ok(line) = serde_json::to_string(rec) else { return };
+        let mut w = self.inner.lock();
+        if let Some(w) = w.as_mut() {
+            use std::io::Write;
+            let _ = w.write_all(line.as_bytes());
+            let _ = w.write_all(b"\n");
+            let _ = w.flush();
+        }
+    }
+}
+
+fn provider_str(p: DnsProvider) -> &'static str {
+    match p {
+        DnsProvider::Cloudflare => "cloudflare",
+        DnsProvider::Google => "google",
+        DnsProvider::Quad9 => "quad9",
+    }
+}
+
+fn mode_str(m: DnsMode) -> &'static str {
+    match m {
+        DnsMode::DoH => "doh",
+        DnsMode::DoT => "dot",
+    }
+}
+
+fn strategy_str(s: DnsStrategy) -> &'static str {
+    match s {
+        DnsStrategy::Single => "single",
+        DnsStrategy::RoundRobin => "round-robin",
+        DnsStrategy::Failover => "failover",
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Resolve a query (policy check, then cache), returning a full response
+/// with the requester's transaction ID patched in. Never fails: on
+/// upstream error it returns SERVFAIL so the client doesn't hang; blocked
+/// domains get NXDOMAIN. Every query is emitted to the event log.
+#[allow(clippy::too_many_arguments)]
 fn resolve(
     query: &[u8],
     target: DnsProvider,
     strategy: DnsStrategy,
+    mode: DnsMode,
     resolver: &Arc<Resolver>,
     failover: &FailoverState,
     cache: &DnsCache,
+    policy: &Arc<parking_lot::RwLock<Policy>>,
+    events: &Arc<QueryEvents>,
 ) -> Vec<u8> {
+    let started = Instant::now();
+    let domain = dns::extract_qname(query).unwrap_or_default();
+
+    let emit = |blocked: bool, error: bool, cached: bool, rtt: u64| {
+        events.emit(&QueryRecordData {
+            domain: domain.clone(),
+            provider: provider_str(target).to_string(),
+            mode: mode_str(mode).to_string(),
+            strategy: strategy_str(strategy).to_string(),
+            rtt_ms: rtt,
+            cached,
+            blocked,
+            error,
+            ts_ms: now_ms(),
+        });
+    };
+
+    if policy.read().blocked(&domain) {
+        emit(true, false, false, 0);
+        return dns::nxdomain(query);
+    }
+
     if let Some(mut resp) = cache.get(query) {
         dns::patch_id(&mut resp, query);
+        emit(false, false, true, 0);
         return resp;
     }
 
@@ -818,22 +1137,28 @@ fn resolve(
             if let Some(ttl) = dns::response_ttl(&r) {
                 cache.put(query, &r, ttl);
             }
+            emit(false, false, false, started.elapsed().as_millis() as u64);
             r
         }
         Err(e) => {
             failover.on_failure(target, strategy);
             warn!("{target:?} failed: {e}");
+            emit(false, true, false, started.elapsed().as_millis() as u64);
             dns::servfail(query)
         }
     };
     resp
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_udp_workers(
     sock: Arc<UdpSocket>,
     resolver: Arc<Resolver>,
     failover: Arc<FailoverState>,
     cache: Arc<DnsCache>,
+    policy: Arc<parking_lot::RwLock<Policy>>,
+    events: Arc<QueryEvents>,
+    mode: DnsMode,
     n: usize,
 ) -> (Vec<SyncSender<Job>>, Vec<JoinHandle<()>>) {
     let mut txs = Vec::with_capacity(n);
@@ -844,9 +1169,21 @@ fn spawn_udp_workers(
         let r = resolver.clone();
         let f = failover.clone();
         let c = cache.clone();
+        let p = policy.clone();
+        let e = events.clone();
         handles.push(std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
-                let mut resp = resolve(&job.query, job.target, job.strategy, &r, &f, &c);
+                let mut resp = resolve(
+                    &job.query,
+                    job.target,
+                    job.strategy,
+                    mode,
+                    &r,
+                    &f,
+                    &c,
+                    &p,
+                    &e,
+                );
                 if resp.len() > dns::MAX_UDP_DNS {
                     dns::set_tc(&mut resp, dns::MAX_UDP_DNS);
                 }
@@ -898,13 +1235,17 @@ fn read_exact(stream: &mut TcpStream, mut buf: &mut [u8]) -> std::io::Result<()>
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_tcp_conn(
     stream: TcpStream,
     strategy: DnsStrategy,
     provider: DnsProvider,
+    mode: DnsMode,
     resolver: Arc<Resolver>,
     failover: Arc<FailoverState>,
     cache: Arc<DnsCache>,
+    policy: Arc<parking_lot::RwLock<Policy>>,
+    events: Arc<QueryEvents>,
 ) {
     let mut stream = stream;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
@@ -924,7 +1265,17 @@ fn handle_tcp_conn(
             continue;
         }
         let target = pick_target(strategy, provider, &failover);
-        let resp = resolve(&query, target, strategy, &resolver, &failover, &cache);
+        let resp = resolve(
+            &query,
+            target,
+            strategy,
+            mode,
+            &resolver,
+            &failover,
+            &cache,
+            &policy,
+            &events,
+        );
         if resp.len() > u16::MAX as usize {
             continue;
         }
@@ -942,6 +1293,8 @@ fn spawn_tcp_thread(
     resolver: Arc<Resolver>,
     failover: Arc<FailoverState>,
     cache: Arc<DnsCache>,
+    policy: Arc<parking_lot::RwLock<Policy>>,
+    events: Arc<QueryEvents>,
     cfg_tx: std::sync::mpsc::Sender<Config>,
     expected_mode: DnsMode,
     mut provider: DnsProvider,
@@ -966,7 +1319,12 @@ fn spawn_tcp_thread(
         while running.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
             if last_check.elapsed() >= Duration::from_millis(500) {
                 last_check = Instant::now();
-                if let Some(cfg) = check_reload(expected_mode, &mut provider, &mut strategy) {
+                if let Some(cfg) = check_reload(
+                    expected_mode,
+                    &mut provider,
+                    &mut strategy,
+                    &policy,
+                ) {
                     let _ = cfg_tx.send(cfg);
                     break;
                 }
@@ -979,10 +1337,16 @@ fn spawn_tcp_thread(
                         continue;
                     }
                     conns.fetch_add(1, Ordering::SeqCst);
-                    let (r, f, c) = (resolver.clone(), failover.clone(), cache.clone());
+                    let (r, f, c, p, e) = (
+                        resolver.clone(),
+                        failover.clone(),
+                        cache.clone(),
+                        policy.clone(),
+                        events.clone(),
+                    );
                     let conns = conns.clone();
                     std::thread::spawn(move || {
-                        handle_tcp_conn(stream, strategy, provider, r, f, c);
+                        handle_tcp_conn(stream, strategy, provider, expected_mode, r, f, c, p, e);
                         conns.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
@@ -1005,6 +1369,8 @@ fn run_proxy_loop(
     resolver: Arc<Resolver>,
     mut strategy: DnsStrategy,
     mut provider: DnsProvider,
+    policy: Arc<parking_lot::RwLock<Policy>>,
+    events: Arc<QueryEvents>,
     running: &Arc<AtomicBool>,
 ) -> Option<Config> {
     let sock = Arc::new(create_udp_socket().unwrap_or_else(|e| {
@@ -1020,6 +1386,9 @@ fn run_proxy_loop(
         resolver.clone(),
         failover.clone(),
         cache.clone(),
+        policy.clone(),
+        events.clone(),
+        mode,
         UPLINK_WORKERS,
     );
 
@@ -1031,6 +1400,8 @@ fn run_proxy_loop(
         resolver,
         failover.clone(),
         cache,
+        policy.clone(),
+        events.clone(),
         cfg_tx,
         mode,
         provider,
@@ -1047,7 +1418,7 @@ fn run_proxy_loop(
     while mode_changed.is_none() {
         if last_check.elapsed() >= Duration::from_millis(500) {
             last_check = Instant::now();
-            if let Some(cfg) = check_reload(mode, &mut provider, &mut strategy) {
+            if let Some(cfg) = check_reload(mode, &mut provider, &mut strategy, &policy) {
                 mode_changed = Some(cfg);
                 break;
             }
@@ -1159,7 +1530,18 @@ mod relay_tests {
         let resolver: Arc<Resolver> = Arc::new(|query, _p| Ok(fake_response(query)));
         let failover = Arc::new(FailoverState::new(DnsProvider::Cloudflare));
         let cache = Arc::new(DnsCache::new());
-        let (txs, handles) = spawn_udp_workers(sock.clone(), resolver, failover.clone(), cache.clone(), 2);
+        let policy = Arc::new(parking_lot::RwLock::new(Policy::default()));
+        let events = Arc::new(QueryEvents::disabled());
+        let (txs, handles) = spawn_udp_workers(
+            sock.clone(),
+            resolver,
+            failover.clone(),
+            cache.clone(),
+            policy,
+            events,
+            DnsMode::DoH,
+            2,
+        );
         let rr = AtomicUsize::new(0);
 
         // Miss: direct resolve, answer carries the requester's ID.
@@ -1188,7 +1570,18 @@ mod relay_tests {
         let resolver: Arc<Resolver> = Arc::new(|_q, _p| Err("upstream down".into()));
         let failover = Arc::new(FailoverState::new(DnsProvider::Cloudflare));
         let cache = Arc::new(DnsCache::new());
-        let (txs, handles) = spawn_udp_workers(sock.clone(), resolver, failover.clone(), cache, 2);
+        let policy = Arc::new(parking_lot::RwLock::new(Policy::default()));
+        let events = Arc::new(QueryEvents::disabled());
+        let (txs, handles) = spawn_udp_workers(
+            sock.clone(),
+            resolver,
+            failover.clone(),
+            cache,
+            policy,
+            events,
+            DnsMode::DoH,
+            2,
+        );
         let rr = AtomicUsize::new(0);
 
         let q = a_query(0x4242);
@@ -1202,11 +1595,75 @@ mod relay_tests {
             let _ = h.join();
         }
     }
+
+    #[test]
+    fn blocked_domain_gets_nxdomain() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        sock.set_read_timeout(Some(Duration::from_millis(2000))).unwrap();
+
+        let resolver: Arc<Resolver> = Arc::new(|_q, _p| Ok(fake_response(_q)));
+        let failover = Arc::new(FailoverState::new(DnsProvider::Cloudflare));
+        let cache = Arc::new(DnsCache::new());
+        let policy = Arc::new(parking_lot::RwLock::new(Policy {
+            rules: vec![PolicyRule {
+                pattern: "example.com".into(),
+                action: "block".into(),
+            }],
+        }));
+        let events = Arc::new(QueryEvents::disabled());
+        let (txs, handles) = spawn_udp_workers(
+            sock.clone(),
+            resolver,
+            failover,
+            cache,
+            policy,
+            events,
+            DnsMode::DoH,
+            2,
+        );
+        let rr = AtomicUsize::new(0);
+
+        let q = a_query(0x5151);
+        let resp = relay_roundtrip(&sock, &txs, &rr, &q, DnsProvider::Cloudflare, DnsStrategy::Single);
+        assert_eq!(resp[3] & 0x0F, 0x03, "blocked query answered NXDOMAIN");
+        assert_eq!(&resp[..2], &[0x51, 0x51], "echoes requester ID");
+
+        drop(txs);
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+
+    #[test]
+    fn policy_allow_overrides_block() {
+        let p = Policy {
+            rules: vec![
+                PolicyRule { pattern: "example.com".into(), action: "block".into() },
+                PolicyRule { pattern: "www.example.com".into(), action: "allow".into() },
+            ],
+        };
+        assert!(p.blocked("example.com"), "blocked domain stays blocked");
+        assert!(!p.blocked("www.example.com"), "allow overrides block regardless of order");
+        assert!(!p.blocked("google.com"), "unmatched is allowed");
+    }
+
+    #[test]
+    fn policy_suffix_and_dot_forms() {
+        let p = Policy {
+            rules: vec![PolicyRule { pattern: ".ads.com".into(), action: "block".into() }],
+        };
+        assert!(p.blocked("ads.com"));
+        assert!(p.blocked("cdn.ads.com"));
+        assert!(!p.blocked("notads.com"), "label boundary respected");
+        assert!(!p.blocked(""), "empty domain never matches");
+    }
 }
 
 fn run_doh(
     strategy: DnsStrategy,
     provider: DnsProvider,
+    policy: Arc<parking_lot::RwLock<Policy>>,
+    events: Arc<QueryEvents>,
     running: &Arc<AtomicBool>,
 ) -> Option<Config> {
     let agent = match dns::create_doh_agent() {
@@ -1233,17 +1690,19 @@ fn run_doh(
             dns::doh_resolve_fallible(&agent, target, query)
         }
     });
-    run_proxy_loop(DnsMode::DoH, resolver, strategy, provider, running)
+    run_proxy_loop(DnsMode::DoH, resolver, strategy, provider, policy, events, running)
 }
 
 fn run_dot(
     strategy: DnsStrategy,
     provider: DnsProvider,
+    policy: Arc<parking_lot::RwLock<Policy>>,
+    events: Arc<QueryEvents>,
     running: &Arc<AtomicBool>,
 ) -> Option<Config> {
     let pool = Arc::new(dns::DotPool::new(4));
     let resolver: Arc<Resolver> = Arc::new(move |query, target| pool.query(target, query));
-    run_proxy_loop(DnsMode::DoT, resolver, strategy, provider, running)
+    run_proxy_loop(DnsMode::DoT, resolver, strategy, provider, policy, events, running)
 }
 
 fn create_udp_socket() -> std::io::Result<UdpSocket> {
@@ -1257,10 +1716,18 @@ fn create_udp_socket() -> std::io::Result<UdpSocket> {
 }
 
 /// Check config.json every 500 ms. If mode changed, return the new config
-/// so the caller can re-enter the correct loop. Otherwise update provider/strategy.
-fn check_reload(expected: DnsMode, provider: &mut DnsProvider, strategy: &mut DnsStrategy) -> Option<Config> {
+/// so the caller can re-enter the correct loop. Otherwise update
+/// provider/strategy. The policy is refreshed from config.json every
+/// check, so SetPolicy hot-swaps live.
+fn check_reload(
+    expected: DnsMode,
+    provider: &mut DnsProvider,
+    strategy: &mut DnsStrategy,
+    policy: &parking_lot::RwLock<Policy>,
+) -> Option<Config> {
     let cfg = Config::load();
     let mode = parse_mode(&cfg.mode);
+    *policy.write() = Policy::from_config(&cfg);
     if mode != expected {
         return Some(cfg);
     }

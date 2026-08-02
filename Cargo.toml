@@ -1,6 +1,6 @@
 [package]
 name = "dns-guard"
-version = "1.2.1"
+version = "1.3.0"
 edition = "2021"
 description = "System-wide encrypted DNS proxy — DoH + DoT"
 
@@ -31,6 +31,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 parking_lot = "0.12"
 tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
+axum = "0.8"
 socket2 = "0.5"
 
 [build-dependencies]

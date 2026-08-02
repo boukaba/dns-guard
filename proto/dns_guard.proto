@@ -9,6 +9,44 @@ service DnsGuard {
   rpc Logs(LogsRequest) returns (stream LogEntry);
   rpc SetPassword(PasswordRequest) returns (PasswordResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+  rpc WatchQueries(WatchQueriesRequest) returns (stream QueryRecord);
+  rpc SetPolicy(Policy) returns (PolicyResponse);
+  rpc GetPolicy(GetPolicyRequest) returns (Policy);
+  rpc GetStats(GetStatsRequest) returns (Stats);
+}
+
+message WatchQueriesRequest {}
+message QueryRecord {
+  string domain = 1;
+  string provider = 2;
+  string mode = 3;
+  string strategy = 4;
+  uint32 rtt_ms = 5;
+  bool cached = 6;
+  bool blocked = 7;
+  bool error = 8;
+  uint64 ts_ms = 9;
+}
+
+message Policy {
+  message Rule {
+    string pattern = 1;
+    enum Action { ALLOW = 0; BLOCK = 1; }
+    Action action = 2;
+  }
+  repeated Rule rules = 1;
+}
+message GetPolicyRequest {}
+message PolicyResponse { bool ok = 1; string message = 2; }
+
+message GetStatsRequest {}
+message Stats {
+  uint64 queries_total = 1;
+  uint64 cached_total = 2;
+  uint64 blocked_total = 3;
+  uint64 errors_total = 4;
+  map<string, uint64> per_provider = 5;
+  map<string, uint64> top_domains = 6;
 }
 
 message ShutdownRequest {}

@@ -316,6 +316,10 @@ pub fn servfail(query: &[u8]) -> Vec<u8> {
     if resp.len() == 12 {
         resp[2] = (query[2] & 0x01) | 0x80; // QR=1, preserve RD
         resp[3] = 0x82;                    // RA=1, RCODE=2 (SERVFAIL)
+        // The question is echoed below; the original query may carry
+        // additional records (e.g. EDNS0 OPT) that we do not echo, so
+        // zero the section counts to keep the message well-formed.
+        resp[6..12].fill(0);
         if let Some(qend) = skip_name(query, 12) {
             if qend + 4 <= query.len() {
                 resp.extend_from_slice(&query[12..qend + 4]);
@@ -323,6 +327,57 @@ pub fn servfail(query: &[u8]) -> Vec<u8> {
         }
     }
     resp
+}
+
+/// Build an NXDOMAIN response (RCODE=3) that echoes the query's ID +
+/// question — used when a policy rule blocks a domain.
+pub fn nxdomain(query: &[u8]) -> Vec<u8> {
+    let mut resp = servfail(query);
+    if resp.len() >= 4 {
+        resp[3] = (resp[3] & 0xF0) | 0x03;
+    }
+    resp
+}
+
+/// Extract the lowercase question name (e.g. "www.example.com") from a
+/// DNS query message, or None when it cannot be parsed. Compression
+/// pointers are not expected in queries and reject the parse.
+pub fn extract_qname(query: &[u8]) -> Option<String> {
+    if query.len() < 13 {
+        return None;
+    }
+    let mut pos = 12usize;
+    let mut labels: Vec<&[u8]> = Vec::new();
+    loop {
+        let len = *query.get(pos)?;
+        match len & 0xC0 {
+            0xC0 => return None, // compression pointer — not valid in queries
+            0x40 | 0x80 => return None, // extended labels — unsupported
+            _ => {
+                if len == 0 {
+                    break;
+                }
+                pos += 1;
+                let label = query.get(pos..pos + len as usize)?;
+                labels.push(label);
+                pos += len as usize;
+                if pos >= query.len() {
+                    return None;
+                }
+            }
+        }
+    }
+    if labels.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (i, l) in labels.iter().enumerate() {
+        if i > 0 {
+            out.push('.');
+        }
+        out.push_str(&String::from_utf8_lossy(l).to_lowercase());
+    }
+    Some(out)
 }
 
 // ── DoH implementation ──
@@ -606,6 +661,32 @@ mod tests {
         assert_eq!(resp[3] & 0x0F, 0x02);      // RCODE = SERVFAIL
         assert_eq!(resp[3] & 0x80, 0x80);      // RA set
         assert_eq!(&resp[12..], &query[12..]); // question echoed
+    }
+
+    #[test]
+    fn nxdomain_has_rcode_3() {
+        let mut query = vec![0x42, 0x69, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        query.extend_from_slice(&encode_name("example.com"));
+        query.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+
+        let resp = nxdomain(&query);
+        assert_eq!(&resp[0..2], &[0x42, 0x69]);
+        assert_eq!(resp[3] & 0x0F, 0x03);      // RCODE = NXDOMAIN
+        assert_eq!(&resp[12..], &query[12..]); // question echoed
+    }
+
+    #[test]
+    fn qname_parses_labels_lowercased() {
+        let mut q = vec![0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        q.extend_from_slice(&encode_name("WWW.Example.COM"));
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        assert_eq!(extract_qname(&q).as_deref(), Some("www.example.com"));
+    }
+
+    #[test]
+    fn qname_rejects_garbage() {
+        assert_eq!(extract_qname(&[0u8; 8]), None);
+        assert_eq!(extract_qname(&[0u8; 20]), None); // zero-length labels only
     }
 
     #[test]

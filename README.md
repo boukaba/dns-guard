@@ -100,16 +100,49 @@ dns-guard stop
 | `dns-guard stop [--addr]` | Tell the daemon to stop the proxy |
 | `dns-guard status [--addr]` | Running? pid, mode, provider, strategy |
 | `dns-guard logs [--addr]` | Tail live proxy logs |
+| `dns-guard stats [--addr]` | Query aggregates: totals, blocked, per-provider, top domains |
+| `dns-guard policy [--addr]` | List block/allow rules |
+| `dns-guard policy --block DOMAIN` / `--allow DOMAIN` / `--clear` | Add a rule / remove all rules (applied live) |
 | `dns-guard set-password --password PW [--addr]` | Store sudo password in the daemon |
 | `-v, --verbose` | Debug logging |
 | `--state-dir DIR` | Override state/config/log directory (`DNS_GUARD_DIR` env) |
-| `--json` | JSON output for start/stop/status |
+| `--json` | JSON output for start/stop/status/stats/policy |
 
 ---
 
-## 3. gRPC API
+## 3. Control API
 
-The daemon (`dns-guard serve`) exposes a gRPC service on a Unix socket (`~/.config/dns-guard/dns-guard.sock`, chmod 0600, owner-only). The GUI and CLI client commands are both thin wrappers over it — you can drive dns-guard from any gRPC-capable language or tool.
+The daemon (`dns-guard serve`) exposes a **gRPC service** on a Unix socket (`~/.config/dns-guard/dns-guard.sock`, chmod 0600, owner-only) **and a JSON REST API** on `http://127.0.0.1:8090` (self-describing: `GET /openapi.yaml`). The GUI and CLI client commands are thin wrappers over them — you can drive dns-guard from any gRPC-capable language, a plain HTTP client, or an AI agent that reads the OpenAPI spec.
+
+### REST (agents / scripts)
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/status` | Running? pid, mode, provider, strategy |
+| `POST /api/v1/start` `{mode, provider, strategy}` | Start the proxy (needs password set via gRPC `SetPassword`) |
+| `POST /api/v1/stop` | Stop the proxy, restore DNS |
+| `POST /api/v1/config` `{mode, provider, strategy}` | Hot-swap live — no restart, no password |
+| `GET /api/v1/policy` / `PUT /api/v1/policy` `{rules:[{pattern, action}]}` | Read / replace block & allow rules (live) |
+| `GET /api/v1/stats` | Query aggregates: totals, cached, blocked, errors, per-provider, top domains |
+| `GET /api/v1/queries` | Recent query records (ring of 500) |
+| `GET /api/v1/queries/stream` | Live query feed (SSE, event `query`) |
+| `GET /api/v1/logs` / `GET /api/v1/logs/stream` | Recent log lines / live log feed (SSE, event `log`) |
+| `GET /openapi.yaml` | Full OpenAPI spec (also served to discover the API) |
+
+Policy rules: `pattern` matches the domain and its subdomains (`"example.com"` → `example.com` + `*.example.com`); `action` is `allow` or `block`. Allow rules override block rules; the default is allow. Blocked queries get NXDOMAIN.
+
+```bash
+# Block a tracker domain, live
+curl -X PUT http://127.0.0.1:8090/api/v1/policy \
+  -d '{"rules":[{"pattern":"ads.example.com","action":"block"}]}'
+
+# Watch live DNS traffic
+curl -N http://127.0.0.1:8090/api/v1/queries/stream
+```
+
+`DNS_GUARD_HTTP_PORT` overrides the port (default 8090); `DNS_GUARD_HTTP=0` disables the REST API entirely.
+
+### gRPC
 
 Service `dns_guard.DnsGuard` ([proto](proto/dns_guard.proto)):
 
@@ -122,6 +155,10 @@ Service `dns_guard.DnsGuard` ([proto](proto/dns_guard.proto)):
 | `Logs` | `LogsRequest{}` → `stream LogEntry{line}` | Server-streaming logs (500-line history + live lines) |
 | `SetPassword` | `PasswordRequest{password}` → `PasswordResponse{ok, message}` | Store sudo password (validated with `sudo -S -v`) |
 | `Shutdown` | `ShutdownRequest{}` → `ShutdownResponse{ok}` | Stop the proxy (if possible) and exit the daemon |
+| `WatchQueries` | `WatchQueriesRequest{}` → `stream QueryRecord{domain, provider, mode, strategy, rtt_ms, cached, blocked, error, ts_ms}` | Live per-query feed (500-record history + live records) |
+| `SetPolicy` | `Policy{rules:[{pattern, action}]}` → `PolicyResponse{ok, message}` | Replace block/allow rules live — no password needed |
+| `GetPolicy` | `GetPolicyRequest{}` → `Policy` | Read the current rules |
+| `GetStats` | `GetStatsRequest{}` → `Stats{queries_total, cached_total, blocked_total, errors_total, per_provider, top_domains}` | Query aggregates for the current proxy session |
 
 **Quick check with [grpcurl](https://github.com/fullstorydev/grpcurl):**
 
@@ -140,6 +177,10 @@ grpcurl -unix -plaintext -d '{"provider":"quad9","strategy":"failover"}' \
 # Stream logs
 grpcurl -unix -plaintext ~/.config/dns-guard/dns-guard.sock \
   dns_guard.DnsGuard/Logs
+
+# Block a domain live
+grpcurl -unix -plaintext -d '{"rules":[{"pattern":"ads.example.com","action":"BLOCK"}]}' \
+  ~/.config/dns-guard/dns-guard.sock dns_guard.DnsGuard/SetPolicy
 ```
 
 **Python example** (using `grpcio` + generated stubs):
@@ -172,8 +213,9 @@ Everything lives in `~/.config/dns-guard/` (`--state-dir` / `DNS_GUARD_DIR` to o
 
 | File | Purpose |
 |---|---|
-| `config.json` | Last-used mode / provider / strategy (CLI flags override) |
+| `config.json` | Last-used mode / provider / strategy + block/allow policy (CLI flags override; policy hot-swaps live) |
 | `state.json` | Proxy pid + running state (written by the proxy itself) |
+| `query.log` | Per-query event log (JSON lines, tailed by the daemon for WatchQueries/GetStats) |
 | `proxy.log` | Direct-mode `--background` logs |
 | `server.log` | Daemon logs |
 | `dns-guard.sock` | gRPC control socket (0600, owner-only) |

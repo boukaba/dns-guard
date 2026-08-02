@@ -80,6 +80,9 @@ dns-guard has two independent run modes:
 - On startup, reads `~/.config/dns-guard/state.json` — if a proxy PID is recorded and alive, it **adopts** it (also adopts lazily on every `status()` call, so GUI-supervised proxies are picked up on the first poll).
 - Spawns proxy as foreground child (via sudo with password from `SetPassword`) — the **CLI-only** flow; captures stdout/stderr for log streaming.
 - Adopted proxies (GUI-supervised, root-spawned via AuthorizationServices) are not children — the daemon **tails `proxy.log`** (world-readable 0o644) from its current end into the log broadcast.
+- **Per-query events** — the proxy appends one JSON line per query to `query.log` (world-readable, truncated at proxy start). The daemon tails it like proxy.log: on tail start it replays the whole current file into **stats only** (GetStats), then broadcasts new records live (WatchQueries, 500-record history ring). A truncation (new proxy session) resets stats and replays again.
+- **Block/allow policy** — lives in `config.json` under `"policy": [{"pattern", "action"}]`. The proxy refreshes it every 500ms alongside provider/strategy (hot-swap). Semantics: patterns match the domain + subdomains (`"example.com"` → `example.com`, `*.example.com`); allow overrides block; default allow; blocked queries get NXDOMAIN (well-formed: section counts zeroed, unlike the echoed EDNS0-carrying question header). `SetPolicy`/`GetPolicy` RPCs need no password. `state::save_config`/`save_policy` are read-modify-write over config.json so sections never clobber each other.
+- **REST API** — the daemon also binds `http://127.0.0.1:8090` (axum, `src/rest.rs`): JSON mirror of the gRPC service + SSE streams (`/api/v1/queries/stream`, `/api/v1/logs/stream`) + `/openapi.yaml` (embedded from `docs/openapi.yaml`) for agent discovery. `DNS_GUARD_HTTP_PORT` overrides, `DNS_GUARD_HTTP=0` disables. Note: TCP 127.0.0.1 is weaker isolation than the 0600 unix socket (any local user).
 - Persists proxy state to disk on every start/stop.
 - Supports config hot-swap: `set_config` RPC always writes `config.json` (no password needed); SIGHUP is best-effort and only for password-managed children — the GUI sends its own SIGHUP via its AuthorizationRef, and the proxy polls every 500ms regardless.
 - Logs fan out via a broadcast channel + 500-line history ring; every `Logs` subscriber gets history then live lines. New subscribers never steal the stream from existing ones.
@@ -93,7 +96,7 @@ dns-guard has two independent run modes:
 - Multi-threaded relay: UDP dispatch thread + 8-worker resolution pool (DoH) / 4-connection DoT pool, plus a TCP :53 fallback listener for truncated responses. Responses are TTL-cached (2048 entries) and re-ID'd per client.
 - Strategy is per-query: failover advances only when the current strategy is Failover, so provider/strategy hot-swap live (no restart).
 
-**Client commands** (`dns-guard start|stop|status|logs|set-password --addr SOCKET`)
+**Client commands** (`dns-guard start|stop|status|logs|set-password|stats|policy --addr SOCKET`)
 - Talk to a running gRPC server via CLI.
 - `--json` outputs machine-parseable JSON for GUI integration.
 
@@ -149,6 +152,8 @@ the password in memory and spawns `sudo -S dns-guard ...` as a foreground child
 - **Config hot-swap via file polling** — proxy checks `config.json` every 500ms in event loop. Provider/strategy changes take effect without restart. Mode changes cause loop function to return and `cmd_standalone` re-enters with correct mode.
 - **Failover state is strategy-agnostic** — `FailoverState` tracks the sticky provider index only; `on_failure` advances only when the current per-query strategy is Failover, so hot-swapping INTO failover engages it live.
 - **`state::save_config` removes file before writing** — because previous write by root-owned proxy leaves file root-owned, preventing non-root daemon from overwriting.
+- **config.json lives in `state::dir()`** — the proxy's `Config::path()` uses `guard_state::dir()`, NOT HOME, so `--state-dir`/`DNS_GUARD_DIR` and the daemon agree on the file. Both writers (proxy hot-swap poll, daemon save_config/save_policy) are read-modify-write; `Config` fields are all `#[serde(default)]` so a partial file (e.g. policy-only) parses.
+- **SERVFAIL/NXDOMAIN responses zero the section counts (bytes 6..12)** — dig queries carry EDNS0 OPT records; echoing the header ARCOUNT without the OPT makes clients report "malformed message packet".
 
 ## Known limitations
 

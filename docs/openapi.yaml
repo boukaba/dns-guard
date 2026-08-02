@@ -1,0 +1,240 @@
+openapi: 3.0.3
+info:
+  title: dns-guard API
+  version: 1.3.0
+  description: |
+    Local control API for the dns-guard encrypted-DNS proxy. Listen on
+    127.0.0.1 (port 8090 by default; DNS_GUARD_HTTP_PORT to override,
+    DNS_GUARD_HTTP=0 to disable). Same capabilities as the gRPC service
+    on the unix socket.
+
+    Typical agent flow: GET /api/v1/status → check `running`; if not,
+    POST /api/v1/start; PUT /api/v1/policy to block trackers; subscribe
+    to /api/v1/queries/stream (SSE) to watch live resolutions; GET
+    /api/v1/stats for aggregates.
+servers:
+  - url: http://127.0.0.1:8090
+paths:
+  /api/v1/status:
+    get:
+      summary: Proxy runtime status
+      operationId: getStatus
+      responses:
+        "200":
+          description: Status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  running: { type: boolean }
+                  pid: { type: integer }
+                  mode: { type: string, enum: [doh, dot] }
+                  provider: { type: string, enum: [cloudflare, google, quad9] }
+                  strategy: { type: string, enum: [single, round-robin, failover] }
+  /api/v1/start:
+    post:
+      summary: Start the proxy (requires prior password authentication via gRPC)
+      operationId: startProxy
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode: { type: string, enum: [doh, dot] }
+                provider: { type: string, enum: [cloudflare, google, quad9] }
+                strategy: { type: string, enum: [single, round-robin, failover] }
+      responses:
+        "200":
+          description: Start result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  message: { type: string }
+  /api/v1/stop:
+    post:
+      summary: Stop the proxy
+      operationId: stopProxy
+      responses:
+        "200":
+          description: Stop result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  message: { type: string }
+  /api/v1/config:
+    post:
+      summary: Hot-swap mode/provider/strategy without restarting
+      operationId: setConfig
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode: { type: string, enum: [doh, dot] }
+                provider: { type: string, enum: [cloudflare, google, quad9] }
+                strategy: { type: string, enum: [single, round-robin, failover] }
+      responses:
+        "200":
+          description: Config result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+  /api/v1/policy:
+    get:
+      summary: List the block/allow policy
+      operationId: getPolicy
+      responses:
+        "200":
+          description: Policy rules
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rules:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Rule"
+    put:
+      summary: Replace the block/allow policy (hot-swaps live)
+      operationId: setPolicy
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rules:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/Rule"
+      responses:
+        "200":
+          description: Policy result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  message: { type: string }
+  /api/v1/stats:
+    get:
+      summary: Aggregated query statistics (current proxy session)
+      operationId: getStats
+      responses:
+        "200":
+          description: Stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queries_total: { type: integer }
+                  cached_total: { type: integer }
+                  blocked_total: { type: integer }
+                  errors_total: { type: integer }
+                  per_provider:
+                    type: object
+                    additionalProperties: { type: integer }
+                  top_domains:
+                    type: object
+                    additionalProperties: { type: integer }
+  /api/v1/queries:
+    get:
+      summary: Recent query records (ring of 500)
+      operationId: getQueries
+      responses:
+        "200":
+          description: Recent queries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/QueryRecord"
+  /api/v1/queries/stream:
+    get:
+      summary: Live query feed (SSE, event type `query`)
+      operationId: watchQueries
+      responses:
+        "200":
+          description: Server-Sent Events stream
+          content:
+            text/event-stream:
+              schema:
+                type: object
+                properties:
+                  event: { type: string, enum: [query] }
+                  data:
+                    $ref: "#/components/schemas/QueryRecord"
+  /api/v1/logs:
+    get:
+      summary: Recent proxy log lines (ring of 500)
+      operationId: getLogs
+      responses:
+        "200":
+          description: Recent lines
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lines:
+                    type: array
+                    items: { type: string }
+  /api/v1/logs/stream:
+    get:
+      summary: Live log feed (SSE, event type `log`)
+      operationId: watchLogs
+      responses:
+        "200":
+          description: Server-Sent Events stream
+          content:
+            text/event-stream:
+              schema:
+                type: object
+                properties:
+                  event: { type: string, enum: [log] }
+                  data: { type: string }
+components:
+  schemas:
+    Rule:
+      type: object
+      properties:
+        pattern:
+          type: string
+          description: >
+            Domain pattern. "example.com" matches the domain and all
+            subdomains; a leading dot is ignored. Allow rules override
+            block rules; the default is allow.
+        action:
+          type: string
+          enum: [allow, block]
+    QueryRecord:
+      type: object
+      properties:
+        domain: { type: string }
+        provider: { type: string }
+        mode: { type: string }
+        strategy: { type: string }
+        rtt_ms: { type: integer }
+        cached: { type: boolean }
+        blocked: { type: boolean }
+        error: { type: boolean }
+        ts_ms: { type: integer }

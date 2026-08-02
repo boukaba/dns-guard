@@ -82,6 +82,12 @@ pub fn proxy_log_path() -> PathBuf {
     dir().join("proxy.log")
 }
 
+/// Per-query event log written by the proxy (root) and tailed by the
+/// daemon for WatchQueries / GetStats. Truncated by the proxy at start.
+pub fn query_log_path() -> PathBuf {
+    dir().join("query.log")
+}
+
 pub fn load() -> State {
     let _ = std::fs::create_dir_all(dir());
     match std::fs::read_to_string(path()) {
@@ -103,17 +109,42 @@ pub fn clear() {
     save(&State::new());
 }
 
+/// Read the current config.json as JSON (defaults to `{}` when missing).
+/// Used by save_config/save_policy so unrelated sections are preserved.
+pub fn load_config_json() -> serde_json::Value {
+    match std::fs::read_to_string(dir().join("config.json")) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
+        Err(_) => serde_json::json!({}),
+    }
+}
+
 /// Save the runtime proxy configuration to disk so a running proxy can
 /// hot-reload it without being restarted (used by `set_config` RPC).
+/// Preserves the `policy` section if present.
 ///
 /// Removes the file first so it works even if the previous file is root-owned
 /// (written by the proxy running under sudo).
 pub fn save_config(mode: &str, provider: &str, strategy: &str) {
+    let mut cfg = load_config_json();
+    cfg["mode"] = serde_json::json!(mode);
+    cfg["provider"] = serde_json::json!(provider);
+    cfg["strategy"] = serde_json::json!(strategy);
+    write_config_json(&cfg);
+}
+
+/// Save the block/allow policy (JSON array of {pattern, action}) to
+/// config.json, preserving the mode/provider/strategy sections.
+pub fn save_policy(policy: &serde_json::Value) {
+    let mut cfg = load_config_json();
+    cfg["policy"] = policy.clone();
+    write_config_json(&cfg);
+}
+
+fn write_config_json(cfg: &serde_json::Value) {
     let _ = std::fs::create_dir_all(dir());
     let path = dir().join("config.json");
     let _ = std::fs::remove_file(&path);
-    let cfg = serde_json::json!({ "mode": mode, "provider": provider, "strategy": strategy });
-    if let Ok(s) = serde_json::to_string_pretty(&cfg) {
+    if let Ok(s) = serde_json::to_string_pretty(cfg) {
         let _ = std::fs::write(&path, s);
     }
 }
