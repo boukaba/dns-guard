@@ -76,12 +76,13 @@ pub fn create_dot_conn(provider: DnsProvider) -> Result<DotConn, String> {
         .map_err(|e| format!("set_write_to: {e}"))?;
     let connector = native_tls::TlsConnector::new().map_err(|e| format!("tls init: {e}"))?;
     let tls = connector.connect(hostname, stream).map_err(|e| format!("tls handshake: {e}"))?;
-    Ok(DotConn { stream: tls, provider })
+    Ok(DotConn { stream: tls, provider, created: Instant::now() })
 }
 
 pub struct DotConn {
     stream: native_tls::TlsStream<TcpStream>,
     pub provider: DnsProvider,
+    created: Instant,
 }
 
 pub fn dot_query(conn: &mut DotConn, query: &[u8]) -> Result<Vec<u8>, String> {
@@ -104,8 +105,11 @@ pub fn dot_query(conn: &mut DotConn, query: &[u8]) -> Result<Vec<u8>, String> {
 // DoT queries over a single TLS connection are inherently serialised
 // (one in-flight query per connection). A small pool of independent
 // connections lets concurrent workers/connections resolve in parallel.
-// Connections are recreated lazily when the provider changes (hot-swap)
-// or after a failure.
+// Connections are recreated lazily when the provider changes (hot-swap),
+// after a failure, or when idle too long (DoT servers close idle
+// connections aggressively).
+
+const DOT_CONN_MAX_IDLE: Duration = Duration::from_secs(15);
 
 pub struct DotPool {
     slots: Vec<parking_lot::Mutex<Option<DotConn>>>,
@@ -125,16 +129,33 @@ impl DotPool {
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
         let mut slot = self.slots[idx].lock();
 
-        if slot.as_ref().map(|c| c.provider) != Some(provider) {
+        // Drop stale pooled connections: wrong provider or idle too long.
+        if let Some(c) = slot.as_ref() {
+            if c.provider != provider || c.created.elapsed() >= DOT_CONN_MAX_IDLE {
+                *slot = None;
+            }
+        }
+        if slot.is_none() {
             *slot = Some(create_dot_conn(provider)?);
         }
 
         match dot_query(slot.as_mut().unwrap(), query) {
             Ok(r) => Ok(r),
             Err(e) => {
-                // Drop the broken connection so the next query reconnects.
+                // Connection died (server closes idle connections) — drop it
+                // and retry once on a fresh connection. DNS queries are
+                // idempotent, so resending is safe.
                 *slot = None;
-                Err(e)
+                match create_dot_conn(provider) {
+                    Ok(mut fresh) => match dot_query(&mut fresh, query) {
+                        Ok(r) => {
+                            *slot = Some(fresh);
+                            Ok(r)
+                        }
+                        Err(e2) => Err(format!("{e}; retry: {e2}")),
+                    },
+                    Err(e2) => Err(format!("{e}; connect: {e2}")),
+                }
             }
         }
     }
