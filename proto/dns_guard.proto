@@ -1,0 +1,57 @@
+syntax = "proto3";
+package dns_guard;
+
+service DnsGuard {
+  rpc Start(StartRequest) returns (StartResponse);
+  rpc Stop(StopRequest) returns (StopResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc SetConfig(ConfigRequest) returns (ConfigResponse);
+  rpc Logs(LogsRequest) returns (stream LogEntry);
+  rpc SetPassword(PasswordRequest) returns (PasswordResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+message ShutdownRequest {}
+message ShutdownResponse { bool ok = 1; }
+
+message StartRequest {
+  string mode = 1;
+  string provider = 2;
+  string strategy = 3;
+}
+
+message StartResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message StopRequest {}
+message StopResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message StatusRequest {}
+message StatusResponse {
+  bool running = 1;
+  uint32 pid = 2;
+  string mode = 3;
+  string provider = 4;
+  string strategy = 5;
+}
+
+message ConfigRequest {
+  string mode = 1;
+  string provider = 2;
+  string strategy = 3;
+}
+message ConfigResponse { bool ok = 1; }
+
+message LogsRequest {}
+message LogEntry { string line = 1; }
+
+message PasswordRequest { string password = 1; }
+message PasswordResponse {
+  bool ok = 1;
+  string message = 2;
+}
