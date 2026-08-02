@@ -15,6 +15,8 @@ System-wide encrypted DNS proxy. Routes all DNS traffic through DNS-over-HTTPS (
 
 Both paths use the same proxy binary and the same gRPC daemon under the hood.
 
+![dns-guard main window](docs/dns-guard.png)
+
 ---
 
 ## 1. GUI (macOS)
