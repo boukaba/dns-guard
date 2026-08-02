@@ -1,6 +1,6 @@
 [package]
 name = "dns-guard"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 description = "System-wide encrypted DNS proxy — DoH + DoT"
 
